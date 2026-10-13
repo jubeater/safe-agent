@@ -518,6 +518,50 @@ assert "Running from HOME diagnostic is clear" 'echo "$OUTPUT" | grep -q "must n
 STDOUT_TEST=$(run_sandbox opencode -- /bin/echo "ONLY_STDOUT" 2>/dev/null)
 assert "Child stdout contains only child output" '[ "$STDOUT_TEST" = "ONLY_STDOUT" ]'
 
+# ---------------------------------------------------------------------------
+# Test Group 9: OpenCode background-service isolation
+# ---------------------------------------------------------------------------
+echo "--- Group 9: OpenCode Background Service Isolation ---"
+rm -rf "$FAKE_HOME" && mkdir -p "$FAKE_HOME/.local/state/opencode"
+SERVICE_JSON="$FAKE_HOME/.local/state/opencode/service.json"
+echo '{"url":"http://127.0.0.1:1","password":"HOST_SERVICE_SECRET"}' > "$SERVICE_JSON"
+SERVICE_HASH=$(sha256sum "$SERVICE_JSON" | cut -d' ' -f1)
+
+set +e
+OUTPUT=$(run_sandbox opencode -- /bin/bash -c 'cat "$HOME/.local/state/opencode/service.json"; echo x > "$HOME/.local/state/opencode/service.json" || exit 42' 2>/dev/null)
+RET=$?
+set -e
+assert "service.json content hidden inside sandbox" '! echo "$OUTPUT" | grep -q HOST_SERVICE_SECRET'
+assert "service.json write denied inside sandbox (42)" '[ $RET -eq 42 ]'
+assert "Host service.json bytes unchanged" '[ "$(sha256sum "$SERVICE_JSON" | cut -d" " -f1)" = "$SERVICE_HASH" ]'
+set +e
+run_sandbox opencode -- /bin/bash -c 'touch "$HOME/.local/state/opencode/new_state"' 2>/dev/null
+RET=$?
+set -e
+assert "OpenCode state dir otherwise still writable" '[ $RET -eq 0 ] && [ -f "$FAKE_HOME/.local/state/opencode/new_state" ]'
+
+# Command rewriting (dry-run; a stub opencode on PATH satisfies the lookup).
+mkdir -p "$STUB_BIN" && printf '#!/bin/sh\nexit 0\n' > "$STUB_BIN/opencode" && chmod 755 "$STUB_BIN/opencode"
+oc_dry() {
+  (cd "$PROJECT_DIR" && SAFE_AGENT_DRY_RUN=1 PATH="$STUB_BIN:$PATH" HOME="$FAKE_HOME" "$LAUNCHER" opencode -- opencode "$@" 2>&1)
+}
+assert "TUI forced onto private server" 'oc_dry | grep -q -- "-- opencode --standalone$"'
+assert "TUI with directory forced onto private server" 'oc_dry . | grep -q -- "-- opencode --standalone \.$"'
+assert "run gets --standalone after subcommand" 'oc_dry --log-level debug run hi | grep -q -- "-- opencode --log-level debug run --standalone hi$"'
+assert "Existing --standalone not duplicated" 'oc_dry run --standalone hi | grep -q -- "-- opencode run --standalone hi$"'
+assert "serve passes through unchanged" 'oc_dry serve --port 4100 | grep -q -- "-- opencode serve --port 4100$"'
+assert "Non-opencode command left alone" '(cd "$PROJECT_DIR" && SAFE_AGENT_DRY_RUN=1 HOME="$FAKE_HOME" "$LAUNCHER" opencode -- /bin/true 2>&1) | grep -q -- "-- /bin/true$"'
+assert "Dry-run masks service.json" 'oc_dry | grep -q -- "--ro-bind-data [0-9]* $SERVICE_JSON"'
+for refused in "--server http://127.0.0.1:1" "run --server=http://127.0.0.1:1 hi" "--standalone --server http://x" "service start" "pair"; do
+  set +e
+  # shellcheck disable=SC2086
+  OUTPUT=$(oc_dry $refused)
+  RET=$?
+  set -e
+  assert "Refused: opencode $refused" '[ $RET -ne 0 ] && echo "$OUTPUT" | grep -q "^safe-agent:" && ! echo "$OUTPUT" | grep -q "^dry-run:"'
+done
+rm -rf "$STUB_BIN"
+
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ $FAIL -eq 0 ]; then
   exit 0

@@ -40,7 +40,8 @@ To uninstall, remove `safe-agent`, the `safe-*` symlinks and the
 ```text
 safe-agent          # launcher: parsing, validation, bwrap policy, env filtering, exec
 profiles/
-  opencode.sh       # XDG data/cache/state opencode + SAFE_OPENCODE=1
+  opencode.sh       # XDG data/cache/state opencode + SAFE_OPENCODE=1;
+                    # forces a private in-sandbox server (see below)
   qoder.sh          # ~/.qoder + ~/.config/qoder; executable trees read-only
   pi.sh             # ~/.pi/agent; launcher + install trees read-only
 install.sh          # copies launcher + profiles, creates safe-* symlinks
@@ -54,8 +55,11 @@ tests/
 
 Each profile declares `WRITABLE_DIRS` (state the agent may write),
 `READONLY_DIRS` (executable trees overlaid read-only inside writable
-state), `EXTRA_ENV` (static `NAME=VALUE` entries), and `DEFAULT_BIN`
-(used by the multicall symlink and `doctor`).
+state), `MASKED_FILES` (files inside its own writable state hidden from the
+sandbox), `EXTRA_ENV` (static `NAME=VALUE` entries), and `DEFAULT_BIN`
+(used by the multicall symlink and `doctor`). A profile may also define a
+`profile_adjust_cmd` function, which can rewrite the `CMD` array or `fail`
+on invocations that would escape the sandbox.
 
 ## Usage
 
@@ -143,6 +147,18 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   (and `SAFE_OPENCODE=1` for opencode) are set.
 - Network is intentionally shared (no `--unshare-net`): agents need it,
   and editor integrations need localhost.
+- Agent work must run *inside* the sandbox, not just the UI. OpenCode 2.x
+  clients (TUI, `run`, `mini`, `api`, `models`, `stats`, `reload`) attach by
+  default to a shared host "background service" (`opencode serve --service`,
+  found through `~/.local/state/opencode/service.json`), and that server
+  executes every tool call. A sandboxed client attached to it confines
+  nothing. The opencode profile therefore adds `--standalone` (a private
+  server spawned inside the sandbox), hides `service.json` (the host
+  server's URL + password), and refuses `--server`, `opencode service` and
+  `opencode pair`. `opencode serve` already runs its server in-process and
+  passes through unchanged. On the host, avoid bare `opencode`: it starts
+  the unconfined background service (stop it with `opencode service stop`).
+  The discovery file is only masked if it exists at launch.
 - Launch diagnostics go to stderr, so child stdout stays machine-readable.
 - Profiles are trusted executable Bash. The host stays broadly readable
   except for explicitly masked paths; this is a containment wrapper, not
