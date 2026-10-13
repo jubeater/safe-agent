@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+# safe-agent: generic sandbox launcher for agent CLIs.
+# Usage:
+#   safe-agent <profile> -- <command> [args...]
+#   safe-agent doctor <profile>
+# Multicall (via symlink basename):
+#   safe-opencode [args...]  == safe-agent opencode -- opencode [args...]
+#   safe-qoder [args...]     == safe-agent qoder -- qodercli [args...]
+#   safe-pi [args...]        == safe-agent pi -- pi [args...]
+#
+# Policy (intentionally boring):
+# - host filesystem is readable; writable only at the workspace + profile state
+# - network is shared (no --unshare-net); agents and localhost integrations
+#   need it
+# - environment is rebuilt from an allowlist (--clearenv)
+# - other agents' state roots are hidden from the selected profile
+# - profiles are trusted Bash; they declare state paths + default binary only
+set -euo pipefail
+
+PROG="$(basename "$0")"
+SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+PROFILE_DIR="$SCRIPT_DIR/profiles"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  safe-agent <profile> -- <command> [args...]
+  safe-agent doctor <profile>
+
+Examples:
+  safe-agent opencode -- opencode --version
+  safe-agent opencode -- opencode serve --port 4096
+  safe-agent qoder -- qodercli --version
+  safe-agent pi -- pi --version
+
+Multicall (symlink) form:
+  safe-opencode [args...]
+  safe-qoder [args...]
+  safe-pi [args...]
+EOF
+}
+
+fail() {
+  echo "safe-agent: $*" >&2
+  exit 1
+}
+
+[[ -n "${HOME:-}" ]] || fail "HOME is not set"
+HOME_REAL="$(realpath -m -- "$HOME")"
+[[ "$HOME_REAL" != "/" ]] || fail "HOME must not be /"
+
+# Map multicall basename -> profile name.
+multicall_profile() {
+  case "$1" in
+    safe-opencode) echo "opencode" ;;
+    safe-qoder) echo "qoder" ;;
+    safe-pi) echo "pi" ;;
+    *) return 1 ;;
+  esac
+}
+
+is_valid_profile_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+}
+
+# path_within <ancestor> <path>: true if path == ancestor or path is
+# strictly under ancestor. Component-aware: /home/alice2 is NOT within
+# /home/alice.
+path_within() {
+  [[ "$2" == "$1" || "$2" == "$1"/* ]]
+}
+
+# path_strictly_within <ancestor> <path>: true if path is strictly under
+# ancestor (component-aware).
+path_strictly_within() {
+  [[ "$2" == "$1"/* ]]
+}
+
+# Reject bind roots that would expose HOME (or worse) for writing:
+# /, HOME itself, and any ancestor of HOME.
+reject_unsafe_root() {
+  # $1 = canonical path, $2 = description
+  if [[ "$1" == "/" ]] || path_within "$1" "$HOME_REAL"; then
+    fail "$2 must not be /, HOME, or an ancestor of HOME (got '$1')"
+  fi
+}
+
+PROFILE=""
+CMD=()
+DOCTOR_MODE=0
+
+if [[ "$PROG" == "safe-agent" ]]; then
+  # Explicit form.
+  if [[ $# -lt 1 ]]; then
+    usage
+    fail "invalid invocation: expected <profile> ..."
+  fi
+  if [[ "${1:-}" == "doctor" ]]; then
+    DOCTOR_MODE=1
+    [[ $# -eq 2 ]] || { usage; fail "invalid invocation: expected 'doctor <profile>'"; }
+    PROFILE="$2"
+    is_valid_profile_name "$PROFILE" || fail "unknown profile: $PROFILE"
+  elif [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    usage
+    exit 0
+  else
+    PROFILE="${1:-}"
+    [[ -n "$PROFILE" ]] || { usage; fail "invalid invocation: missing profile"; }
+    is_valid_profile_name "$PROFILE" || fail "unknown profile: $PROFILE"
+    shift
+    [[ $# -ge 1 ]] || { usage; fail "invalid invocation: missing '--' separator"; }
+    [[ "${1:-}" == "--" ]] || { usage; fail "invalid invocation: expected '--' after profile, got '${1:-}'"; }
+    shift
+    [[ $# -ge 1 ]] || fail "missing command: no command after '--'"
+    CMD=("$@")
+  fi
+else
+  # Multicall form: basename decides the profile; the default command comes
+  # from the profile itself (see DEFAULT_BIN below).
+  PROFILE="$(multicall_profile "$PROG")" || fail "invalid invocation: unknown program name '$PROG'"
+fi
+
+# Workspace defines the writable project. Resolve canonically and reject
+# anything that would make HOME (or the whole host) writable.
+PROJECT="$(realpath -- "$PWD")" || fail "cannot resolve workspace: $PWD"
+[[ -d "$PROJECT" ]] || fail "workspace missing: $PROJECT"
+reject_unsafe_root "$PROJECT" "workspace"
+
+command -v bwrap >/dev/null || fail "bubblewrap not installed (bwrap not found)"
+
+# Validate + load profile.
+PROFILE_FILE="$PROFILE_DIR/$PROFILE.sh"
+[[ -f "$PROFILE_FILE" ]] || fail "unknown profile: $PROFILE"
+
+# Profiles may set these only.
+WRITABLE_DIRS=()
+READONLY_DIRS=()
+EXTRA_ENV=()
+DEFAULT_BIN=""
+
+# Profiles are trusted Bash. Source WITHOUT a condition so that `set -e`
+# aborts the launcher on any profile command failure. (A conditional source
+# such as `if ! source ...` suppresses errexit inside the sourced file and
+# would let a half-failed profile load succeed.)
+# shellcheck disable=SC1090
+source "$PROFILE_FILE"
+
+if [[ "$PROG" != "safe-agent" ]]; then
+  [[ -n "${DEFAULT_BIN:-}" ]] || fail "profile '$PROFILE' has no DEFAULT_BIN"
+  case "$DEFAULT_BIN" in
+    *[!A-Za-z0-9._-]*) fail "profile '$PROFILE' has invalid DEFAULT_BIN: $DEFAULT_BIN" ;;
+  esac
+  CMD=("$DEFAULT_BIN" "$@")
+fi
+
+XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}"
+XDG_STATE="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+# Resolve + validate a profile-declared writable path, storing the canonical
+# path in RESOLVED. $1 = declared path, $2 = mkdir|nomkdir. Runs in the main
+# shell (never in a subshell or process substitution) so that fail-closed
+# aborts the launcher. Validation runs BEFORE any host-side directory
+# creation; after creation the path is re-resolved (so a symlinked
+# declaration cannot smuggle in an unsafe target) and re-checked.
+resolve_writable() {
+  local declared="$1" mode="$2" canon
+  [[ -n "$declared" ]] || fail "profile '$PROFILE' declared an empty writable dir"
+  canon="$(realpath -m -- "$declared")" || fail "profile '$PROFILE' has unresolvable path: $declared"
+  reject_unsafe_root "$canon" "profile '$PROFILE' writable path"
+  if [[ "$mode" == "mkdir" ]]; then
+    mkdir -p -- "$canon" || fail "cannot create writable dir: $canon"
+    canon="$(realpath -- "$canon")" || fail "profile '$PROFILE' has unresolvable path: $canon"
+    reject_unsafe_root "$canon" "profile '$PROFILE' writable path"
+  fi
+  RESOLVED="$canon"
+}
+
+# Resolve + validate profile-declared read-only overlays (used to protect
+# executable trees inside a broadly writable state dir), appending canonical
+# paths to OWN_READONLY. Absent paths are skipped: there is nothing to
+# protect on a fresh install. Protected paths must not be symlinks and must
+# be direct children of a declared writable bind root (so no intermediate
+# renamable directory sits between them).
+resolve_readonly() {
+  local declared canon canon_parent matched b
+  for declared in "${READONLY_DIRS[@]+"${READONLY_DIRS[@]}"}"; do
+    [[ -n "$declared" ]] || fail "profile '$PROFILE' declared an empty protected path"
+    if [[ -L "$declared" ]]; then
+      fail "profile '$PROFILE' protected path must not be a symlink: $declared"
+    fi
+    [[ -e "$declared" ]] || continue
+    canon="$(realpath -- "$declared")" || fail "profile '$PROFILE' has unresolvable path: $declared"
+    reject_unsafe_root "$canon" "profile '$PROFILE' protected path"
+    canon_parent="$(dirname "$canon")"
+    matched=0
+    for b in "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}"; do
+      if [[ "$canon_parent" == "$b" ]]; then
+        matched=1
+        break
+      fi
+    done
+    if [[ "$matched" -eq 0 ]]; then
+      fail "profile '$PROFILE' protected path parent ('$canon_parent') must equal a declared writable root: $declared"
+    fi
+    OWN_READONLY+=("$canon")
+  done
+}
+
+OWN_BINDS=()
+RESOLVED=""
+for d in "${WRITABLE_DIRS[@]+"${WRITABLE_DIRS[@]}"}"; do
+  if [[ "$DOCTOR_MODE" -eq 1 ]]; then resolve_writable "$d" "nomkdir"; else resolve_writable "$d" "mkdir"; fi
+  OWN_BINDS+=("$RESOLVED")
+done
+
+OWN_READONLY=()
+resolve_readonly
+
+# Invariant validation for declared writable and protected layouts:
+# (a) Refuse if any component of a declared WRITABLE_DIRS or READONLY_DIRS path
+#     below HOME is a symlink.
+check_no_symlink_prefixes() {
+  local path="$1" base="" rel="" prefix="" part
+  if [[ "$path" == "$HOME"/* ]]; then
+    base="$HOME"
+  elif [[ "$path" == "$HOME_REAL"/* ]]; then
+    base="$HOME_REAL"
+  fi
+  if [[ -n "$base" ]]; then
+    rel="${path#"$base"/}"
+    prefix="$base"
+    local IFS='/'
+    read -ra parts <<< "$rel"
+    for part in "${parts[@]}"; do
+      [[ -n "$part" ]] || continue
+      prefix="$prefix/$part"
+      if [[ -L "$prefix" ]]; then
+        fail "profile '$PROFILE' path component below HOME must not be a symlink: $prefix (in '$path')"
+      fi
+      [[ -e "$prefix" ]] || break
+    done
+  fi
+}
+
+for d in "${WRITABLE_DIRS[@]+"${WRITABLE_DIRS[@]}"}" "${READONLY_DIRS[@]+"${READONLY_DIRS[@]}"}"; do
+  [[ -n "$d" ]] || continue
+  check_no_symlink_prefixes "$d"
+done
+
+# (b) Refuse if a protected entry's writable bind root lies strictly inside
+#     the workspace (PROJECT) or strictly inside another OWN_BINDS root
+#     (which would leave a mutable intermediate ancestor above the bind root).
+for declared in "${READONLY_DIRS[@]+"${READONLY_DIRS[@]}"}"; do
+  [[ -n "$declared" ]] || continue
+  decl_parent="$(dirname "$declared")"
+  canon_parent="$(realpath -m -- "$decl_parent")" || fail "profile '$PROFILE' has unresolvable protected parent: $decl_parent"
+  if path_strictly_within "$PROJECT" "$canon_parent"; then
+    fail "profile '$PROFILE' protected bind root ('$canon_parent') lies strictly inside workspace ('$PROJECT'); refusing to launch"
+  fi
+  for other_bind in "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}"; do
+    if path_strictly_within "$other_bind" "$canon_parent"; then
+      fail "profile '$PROFILE' protected bind root ('$canon_parent') lies strictly inside another writable root ('$other_bind'); refusing to launch"
+    fi
+  done
+done
+
+# Print the writable dirs declared by another profile file, one per line.
+# Runs in a throwaway shell so nothing leaks into this one. Used to derive
+# cross-profile masks from each profile's own declarations (single source of
+# truth). Profiles are trusted code; a failure here fails the launch closed
+# rather than running with incomplete peer masks.
+peer_writables() {
+  bash -c '
+    set -euo pipefail
+    WRITABLE_DIRS=(); READONLY_DIRS=(); EXTRA_ENV=(); DEFAULT_BIN=""
+    # shellcheck disable=SC1090
+    source "$1" >/dev/null 2>&1
+    printf "%s\n" "${WRITABLE_DIRS[@]+"${WRITABLE_DIRS[@]}"}"
+  ' _ "$1"
+}
+
+# overlaps_any <candidate> <path...>: true if candidate equals, contains, or
+# lies within any of the given paths (component-aware).
+overlaps_any() {
+  local cand="$1" o
+  shift
+  for o in "$@"; do
+    if path_within "$cand" "$o" || path_within "$o" "$cand"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Other agents' state roots (auth, sessions) are hidden from the selected
+# profile. Refuse to launch if a peer mask overlaps our workspace or
+# selected profile state, to prevent exposing peer credentials.
+PEER_MASKS=()
+declare -A _seen_peer=()
+shopt -s nullglob
+for other_file in "$PROFILE_DIR"/*.sh; do
+  other="${other_file##*/}"
+  other="${other%.sh}"
+  [[ "$other" == "$PROFILE" ]] && continue
+  is_valid_profile_name "$other" || fail "invalid profile filename: $other_file"
+  peer_list="$(peer_writables "$other_file")" || fail "cannot determine state roots of profile '$other'; refusing to run without peer masks"
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    canon="$(realpath -m -- "$root")" || fail "cannot resolve state root of profile '$other': $root"
+    [[ -d "$canon" ]] || continue
+    if overlaps_any "$canon" "$PROJECT" "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}" "${OWN_READONLY[@]+"${OWN_READONLY[@]}"}"; then
+      fail "peer profile '$other' state root ('$canon') overlaps workspace or selected profile state; refusing to launch"
+    fi
+    if [[ -z "${_seen_peer["$canon"]:-}" ]]; then
+      _seen_peer["$canon"]=1
+      PEER_MASKS+=("$canon")
+    fi
+  done <<<"$peer_list"
+done
+shopt -u nullglob
+
+if [[ "$DOCTOR_MODE" -eq 1 ]]; then
+  echo "profile: $PROFILE"
+  echo "profile file: $PROFILE_FILE"
+  echo "bwrap: $(command -v bwrap)"
+  BIN_TO_CHECK="${DEFAULT_BIN:-$PROFILE}"
+  if command -v "$BIN_TO_CHECK" >/dev/null; then
+    echo "target binary: $(command -v "$BIN_TO_CHECK")"
+  else
+    fail "missing target binary: $BIN_TO_CHECK not found"
+  fi
+  echo "workspace: $PROJECT"
+  for d in "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}"; do
+    echo "writable dir: $d"
+  done
+  for d in "${OWN_READONLY[@]+"${OWN_READONLY[@]}"}"; do
+    echo "read-only overlay: $d"
+  done
+  for d in "${PEER_MASKS[@]+"${PEER_MASKS[@]}"}"; do
+    echo "peer mask: $d"
+  done
+  echo "extra env: ${EXTRA_ENV[*]:-<none>}"
+  echo "doctor: OK (sandbox isolation itself must be verified outside any outer sandbox)"
+  exit 0
+fi
+
+[[ ${#CMD[@]} -ge 1 ]] || fail "missing command"
+command -v "${CMD[0]}" >/dev/null || fail "missing target binary: ${CMD[0]} not found"
+
+BWRAP=(
+  bwrap
+
+  # Lifecycle / process isolation
+  --die-with-parent
+  --unshare-pid
+  --unshare-ipc
+  --unshare-uts
+
+  # Host filesystem is visible, but read-only by default.
+  --ro-bind / /
+
+  # Fresh device/proc/tmp views.
+  --dev /dev
+  --proc /proc
+  --tmpfs /tmp
+
+  # The current project is the main writable area.
+  --bind "$PROJECT" "$PROJECT"
+
+  --chdir "$PROJECT"
+)
+
+# Profile writable binds.
+for d in "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}"; do
+  BWRAP+=(--bind "$d" "$d")
+done
+
+# Read-only overlays protect executable trees inside writable state dirs.
+# They come after the writable binds so the read-only view wins.
+for d in "${OWN_READONLY[@]+"${OWN_READONLY[@]}"}"; do
+  BWRAP+=(--ro-bind "$d" "$d")
+done
+
+#
+# Hide sensitive directories completely.
+# Canonicalise existing paths to their targets so that symlinked dotfiles are
+# masked at their true destinations (bwrap refuses to mount on symlinks).
+# Deduplicate targets and refuse unsafe roots (/, HOME, ancestors) or targets
+# conflicting with workspace or state. Absent and dangling symlink paths
+# have no data to leak and are skipped.
+#
+SENSITIVE_DIRS=(
+  "$HOME/.ssh"
+  "$HOME/.gnupg"
+  "$HOME/.aws"
+  "$HOME/.azure"
+  "$HOME/.kube"
+  "$HOME/.docker"
+  "$HOME/.password-store"
+  "$HOME/.local/share/keyrings"
+
+  # Same credentials under a custom XDG_DATA_HOME (kept alongside the
+  # defaults: credentials may remain at either location).
+  "$XDG_DATA/keyrings"
+
+  # gh/gcloud honor XDG_CONFIG_HOME; mask the resolved location as well as
+  # the default (credentials may remain at either location).
+  "$HOME/.config/gh"
+  "$HOME/.config/gcloud"
+  "$XDG_CONFIG/gh"
+  "$XDG_CONFIG/gcloud"
+
+  # Hide user-session sockets such as SSH agent / DBus / Wayland.
+  "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+  # Host service sockets.
+  "/run/dbus"
+  "/run/podman"
+  "/run/containerd"
+)
+
+declare -A _seen_dirs=()
+UNIQ_SENSITIVE_DIRS=()
+for path in "${SENSITIVE_DIRS[@]}"; do
+  [[ -e "$path" ]] || continue
+  canon="$(realpath -- "$path")" || fail "cannot resolve sensitive directory: $path"
+  reject_unsafe_root "$canon" "sensitive directory target ($path)"
+  [[ -d "$canon" ]] || fail "sensitive directory target must be a directory: $canon (from $path)"
+  if overlaps_any "$canon" "$PROJECT" "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}" "${OWN_READONLY[@]+"${OWN_READONLY[@]}"}"; then
+    fail "sensitive directory '$path' (target '$canon') conflicts with workspace or profile state"
+  fi
+  if [[ -z "${_seen_dirs["$canon"]:-}" ]]; then
+    _seen_dirs["$canon"]=1
+    UNIQ_SENSITIVE_DIRS+=("$canon")
+  fi
+done
+
+for path in "${UNIQ_SENSITIVE_DIRS[@]}"; do
+  BWRAP+=(--tmpfs "$path")
+done
+
+# Hide other agents' state roots (auth, sessions) from this profile.
+for path in "${PEER_MASKS[@]+"${PEER_MASKS[@]}"}"; do
+  BWRAP+=(--tmpfs "$path")
+done
+
+#
+# Hide common credential files. The mask content comes from inherited file
+# descriptors on /dev/null: no predictable cache path is created,
+# truncated, chmodded, or trusted, so a preexisting file or symlink at an
+# old cache location cannot supply mask contents or be modified through it.
+# A fresh descriptor is opened per unique masked file: bwrap consumes the fd
+# for each --ro-bind-data, and fails on duplicate destinations.
+# Symlinked credential paths are canonicalised to their targets before masking
+# so symlinks remain hidden and bwrap does not fail on symlink destinations.
+#
+SENSITIVE_FILES=(
+  "$HOME/.netrc"
+  "$HOME/.git-credentials"
+  "$HOME/.config/git/credentials"
+  "$XDG_CONFIG/git/credentials"
+  "$HOME/.npmrc"
+  "$HOME/.pypirc"
+  "$HOME/.cargo/credentials"
+  "$HOME/.cargo/credentials.toml"
+
+  "/run/docker.sock"
+)
+
+declare -A _seen_files=()
+UNIQ_SENSITIVE_FILES=()
+for path in "${SENSITIVE_FILES[@]}"; do
+  [[ -e "$path" ]] || continue
+  canon="$(realpath -- "$path")" || fail "cannot resolve sensitive file: $path"
+  reject_unsafe_root "$canon" "sensitive file target ($path)"
+  [[ ! -d "$canon" ]] || fail "sensitive file target must not be a directory: $canon (from $path)"
+  if overlaps_any "$canon" "$PROJECT" "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}" "${OWN_READONLY[@]+"${OWN_READONLY[@]}"}"; then
+    fail "sensitive file '$path' (target '$canon') conflicts with workspace or profile state"
+  fi
+  if [[ -z "${_seen_files["$canon"]:-}" ]]; then
+    _seen_files["$canon"]=1
+    UNIQ_SENSITIVE_FILES+=("$canon")
+  fi
+done
+
+for path in "${UNIQ_SENSITIVE_FILES[@]}"; do
+  exec {mask_fd}< /dev/null || fail "cannot open empty mask source"
+  BWRAP+=(--ro-bind-data "$mask_fd" "$path")
+done
+
+#
+# Do NOT leak the parent shell's environment into the agent.
+#
+BWRAP+=(
+  --clearenv
+
+  --setenv HOME "$HOME"
+  --setenv USER "$(id -un)"
+  --setenv LOGNAME "$(id -un)"
+  --setenv SHELL "${SHELL:-/bin/zsh}"
+  --setenv PATH "$PATH"
+  --setenv TERM "${TERM:-xterm-256color}"
+  --setenv LANG "${LANG:-C.UTF-8}"
+
+  --setenv XDG_CONFIG_HOME "$XDG_CONFIG"
+  --setenv XDG_DATA_HOME "$XDG_DATA"
+  --setenv XDG_CACHE_HOME "$XDG_CACHE"
+  --setenv XDG_STATE_HOME "$XDG_STATE"
+
+  --setenv SAFE_AGENT "1"
+  --setenv SAFE_AGENT_PROFILE "$PROFILE"
+)
+
+# Profile-provided extra environment (static NAME=VALUE entries only).
+for e in "${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}"; do
+  case "$e" in
+    *=*) BWRAP+=(--setenv "${e%%=*}" "${e#*=}") ;;
+    *) fail "profile '$PROFILE' has malformed EXTRA_ENV entry: $e" ;;
+  esac
+done
+
+# Nice terminal colors if available.
+if [[ -n "${COLORTERM:-}" ]]; then
+  BWRAP+=(--setenv COLORTERM "$COLORTERM")
+fi
+
+# Launch diagnostics go to stderr so child stdout stays machine-readable
+# (e.g. Pi RPC output piped to another tool).
+{
+  echo "🔒 safe-agent ($PROFILE)"
+  echo "   workspace: $PROJECT"
+  echo "   host filesystem: read-only"
+  echo "   sensitive paths: hidden"
+} >&2
+
+# Test hook: print the sandboxed command instead of executing it.
+# Used to verify argument assembly from inside an outer sandbox, where
+# nested-sandbox filesystem results would not be authoritative.
+if [[ "${SAFE_AGENT_DRY_RUN:-}" == "1" ]]; then
+  printf 'dry-run:'
+  printf ' %q' "${BWRAP[@]}"
+  printf ' --'
+  printf ' %q' "${CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+exec "${BWRAP[@]}" -- "${CMD[@]}"
