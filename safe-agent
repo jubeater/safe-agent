@@ -14,7 +14,9 @@
 #   need it
 # - environment is rebuilt from an allowlist (--clearenv)
 # - other agents' state roots are hidden from the selected profile
-# - profiles are trusted Bash; they declare state paths + default binary only
+# - profiles are trusted Bash; they declare state paths + default binary,
+#   optionally files to hide inside their own state, and an optional
+#   profile_adjust_cmd hook that may rewrite/refuse the command line
 set -euo pipefail
 
 PROG="$(basename "$0")"
@@ -133,9 +135,10 @@ command -v bwrap >/dev/null || fail "bubblewrap not installed (bwrap not found)"
 PROFILE_FILE="$PROFILE_DIR/$PROFILE.sh"
 [[ -f "$PROFILE_FILE" ]] || fail "unknown profile: $PROFILE"
 
-# Profiles may set these only.
+# Profiles may set these only (plus the optional profile_adjust_cmd hook).
 WRITABLE_DIRS=()
 READONLY_DIRS=()
+MASKED_FILES=()
 EXTRA_ENV=()
 DEFAULT_BIN=""
 
@@ -152,6 +155,13 @@ if [[ "$PROG" != "safe-agent" ]]; then
     *[!A-Za-z0-9._-]*) fail "profile '$PROFILE' has invalid DEFAULT_BIN: $DEFAULT_BIN" ;;
   esac
   CMD=("$DEFAULT_BIN" "$@")
+fi
+
+# Profile hook: may rewrite CMD (e.g. force a sandbox-local server) or fail
+# closed on invocations that would escape the sandbox. Skipped in doctor mode,
+# which has no command.
+if [[ "$DOCTOR_MODE" -eq 0 ]] && declare -F profile_adjust_cmd >/dev/null; then
+  profile_adjust_cmd
 fi
 
 XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -219,6 +229,29 @@ done
 OWN_READONLY=()
 resolve_readonly
 
+# Resolve profile-declared files to hide inside the profile's own writable
+# state (e.g. a discovery file holding a host-side server's URL + password).
+# Absent files are skipped. A file must not be a symlink and must lie
+# strictly inside a declared writable root, so a mask can never be pointed
+# at, or fail to cover, anything outside the profile's state.
+OWN_MASKED=()
+for declared in "${MASKED_FILES[@]+"${MASKED_FILES[@]}"}"; do
+  [[ -n "$declared" ]] || fail "profile '$PROFILE' declared an empty masked file"
+  [[ ! -L "$declared" ]] || fail "profile '$PROFILE' masked file must not be a symlink: $declared"
+  [[ -e "$declared" ]] || continue
+  canon="$(realpath -- "$declared")" || fail "profile '$PROFILE' has unresolvable path: $declared"
+  [[ -f "$canon" ]] || fail "profile '$PROFILE' masked file must be a regular file: $declared"
+  matched=0
+  for b in "${OWN_BINDS[@]+"${OWN_BINDS[@]}"}"; do
+    if path_strictly_within "$b" "$canon"; then
+      matched=1
+      break
+    fi
+  done
+  [[ "$matched" -eq 1 ]] || fail "profile '$PROFILE' masked file must lie inside a declared writable root: $declared"
+  OWN_MASKED+=("$canon")
+done
+
 # Invariant validation for declared writable and protected layouts:
 # (a) Refuse if any component of a declared WRITABLE_DIRS or READONLY_DIRS path
 #     below HOME is a symlink.
@@ -275,7 +308,7 @@ done
 peer_writables() {
   bash -c '
     set -euo pipefail
-    WRITABLE_DIRS=(); READONLY_DIRS=(); EXTRA_ENV=(); DEFAULT_BIN=""
+    WRITABLE_DIRS=(); READONLY_DIRS=(); MASKED_FILES=(); EXTRA_ENV=(); DEFAULT_BIN=""
     # shellcheck disable=SC1090
     source "$1" >/dev/null 2>&1
     printf "%s\n" "${WRITABLE_DIRS[@]+"${WRITABLE_DIRS[@]}"}"
@@ -338,6 +371,9 @@ if [[ "$DOCTOR_MODE" -eq 1 ]]; then
   done
   for d in "${OWN_READONLY[@]+"${OWN_READONLY[@]}"}"; do
     echo "read-only overlay: $d"
+  done
+  for d in "${OWN_MASKED[@]+"${OWN_MASKED[@]}"}"; do
+    echo "masked file: $d"
   done
   for d in "${PEER_MASKS[@]+"${PEER_MASKS[@]}"}"; do
     echo "peer mask: $d"
@@ -487,6 +523,15 @@ for path in "${SENSITIVE_FILES[@]}"; do
 done
 
 for path in "${UNIQ_SENSITIVE_FILES[@]}"; do
+  exec {mask_fd}< /dev/null || fail "cannot open empty mask source"
+  BWRAP+=(--ro-bind-data "$mask_fd" "$path")
+done
+
+# Profile-declared files inside its own state (validated above; they come
+# after the writable binds so the empty view wins).
+for path in "${OWN_MASKED[@]+"${OWN_MASKED[@]}"}"; do
+  [[ -z "${_seen_files["$path"]:-}" ]] || continue
+  _seen_files["$path"]=1
   exec {mask_fd}< /dev/null || fail "cannot open empty mask source"
   BWRAP+=(--ro-bind-data "$mask_fd" "$path")
 done
