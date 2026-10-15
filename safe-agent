@@ -140,6 +140,7 @@ WRITABLE_DIRS=()
 READONLY_DIRS=()
 MASKED_FILES=()
 EXTRA_ENV=()
+POST_MASK_BINDS=()
 DEFAULT_BIN=""
 
 # Profiles are trusted Bash. Source WITHOUT a condition so that `set -e`
@@ -308,7 +309,7 @@ done
 peer_writables() {
   bash -c '
     set -euo pipefail
-    WRITABLE_DIRS=(); READONLY_DIRS=(); MASKED_FILES=(); EXTRA_ENV=(); DEFAULT_BIN=""
+    WRITABLE_DIRS=(); READONLY_DIRS=(); MASKED_FILES=(); EXTRA_ENV=(); POST_MASK_BINDS=(); DEFAULT_BIN=""
     # shellcheck disable=SC1090
     source "$1" >/dev/null 2>&1
     printf "%s\n" "${WRITABLE_DIRS[@]+"${WRITABLE_DIRS[@]}"}"
@@ -379,6 +380,7 @@ if [[ "$DOCTOR_MODE" -eq 1 ]]; then
     echo "peer mask: $d"
   done
   echo "extra env: ${EXTRA_ENV[*]:-<none>}"
+  echo "re-exposed paths: ${POST_MASK_BINDS[*]:-<none>}"
   echo "doctor: OK (sandbox isolation itself must be verified outside any outer sandbox)"
   exit 0
 fi
@@ -534,6 +536,36 @@ for path in "${OWN_MASKED[@]+"${OWN_MASKED[@]}"}"; do
   _seen_files["$path"]=1
   exec {mask_fd}< /dev/null || fail "cannot open empty mask source"
   BWRAP+=(--ro-bind-data "$mask_fd" "$path")
+done
+
+#
+# Profile-declared re-exposures (POST_MASK_BINDS).
+# A profile may name individual sockets or files that live inside a masked
+# sensitive directory (typically the compositor's Wayland socket, needed by a
+# TUI's native clipboard reader). Entries are applied AFTER every mask so the
+# re-exposed view wins. Each entry must be an existing socket or regular file
+# and must lie strictly inside one of the masked sensitive directories, so a
+# profile can only un-hide something the sandbox already chose to hide -- it
+# can never add an arbitrary host path.
+#
+declare -A _seen_post=()
+for declared in "${POST_MASK_BINDS[@]+"${POST_MASK_BINDS[@]}"}"; do
+  [[ -n "$declared" ]] || fail "profile '$PROFILE' declared an empty POST_MASK_BINDS entry"
+  canon="$(realpath -- "$declared")" || fail "profile '$PROFILE' has unresolvable POST_MASK_BINDS path: $declared"
+  reject_unsafe_root "$canon" "profile '$PROFILE' re-exposed path"
+  if [[ ! -S "$canon" && ! -f "$canon" ]]; then
+    fail "profile '$PROFILE' re-exposed path must be a socket or regular file: $declared"
+  fi
+  matched=0
+  for mask in "${UNIQ_SENSITIVE_DIRS[@]+"${UNIQ_SENSITIVE_DIRS[@]}"}"; do
+    if path_strictly_within "$mask" "$canon"; then matched=1; break; fi
+  done
+  if [[ "$matched" -eq 0 ]]; then
+    fail "profile '$PROFILE' may only re-expose a path inside a masked sensitive directory: $declared"
+  fi
+  if [[ -n "${_seen_post["$canon"]:-}" ]]; then continue; fi
+  _seen_post["$canon"]=1
+  BWRAP+=(--ro-bind "$canon" "$canon")
 done
 
 #

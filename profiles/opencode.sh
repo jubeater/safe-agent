@@ -28,6 +28,25 @@ EXTRA_ENV+=(
   "SAFE_OPENCODE=1"
 )
 
+# OpenCode's TUI reads images from the host clipboard through the Wayland
+# compositor (native libwayland / wlr-data-control), but safe-agent masks the
+# whole XDG_RUNTIME_DIR. Re-expose only the compositor socket so image paste
+# works, while dbus/SSH-agent sockets stay hidden. The matching env vars must
+# be passed too because --clearenv drops them.
+_oc_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+_oc_wsock="${WAYLAND_DISPLAY:-}"
+if [[ -n "$_oc_wsock" ]]; then
+  [[ "$_oc_wsock" == /* ]] || _oc_wsock="$_oc_runtime/$_oc_wsock"
+  if [[ -S "$_oc_wsock" ]]; then
+    POST_MASK_BINDS+=("$_oc_wsock")
+    EXTRA_ENV+=(
+      "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}"
+      "XDG_RUNTIME_DIR=$_oc_runtime"
+    )
+  fi
+fi
+unset _oc_runtime _oc_wsock
+
 # Rewrite the opencode command line so every server it uses runs inside this
 # sandbox. Only applies when the command is opencode itself (the explicit
 # `safe-agent opencode -- <other>` form is left alone).
