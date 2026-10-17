@@ -23,6 +23,9 @@ WRITABLE_DIRS+=(
 
 EXTRA_ENV+=(
   "SAFE_DSH=1"
+  # No TTY and no credential helper inside the sandbox: without this an
+  # HTTPS `git push` blocks forever on a username prompt instead of failing.
+  "GIT_TERMINAL_PROMPT=0"
 )
 
 # dsh reads these bootstrap variables only from the launching environment
@@ -56,3 +59,25 @@ for _p in "${_dsh_parts[@]}"; do
 done
 EXTRA_ENV+=("PATH=$_dsh_path")
 unset _dsh_home _dsh_runtime _dsh_path _dsh_parts _p
+
+# Git over SSH: forward the host's ssh-agent socket (not the key files, which
+# stay hidden). Keys loaded with e.g. `ssh-add -t 1h` are usable through it
+# until they expire or are removed, so the host-side agent is the gate. Only a
+# socket inside an already-masked directory (~/.ssh/agent/..., or under
+# XDG_RUNTIME_DIR) can be re-exposed; anything else (e.g. /tmp/ssh-*) is
+# skipped with a notice instead of failing the launch. ~/.ssh/known_hosts is
+# re-exposed read-only so host keys (github.com) can be verified.
+if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+  _dsh_sock="$(realpath -q -- "$SSH_AUTH_SOCK")" || _dsh_sock=""
+  _dsh_ssh="$(realpath -q -- "$HOME/.ssh")" || _dsh_ssh=""
+  _dsh_rt="$(realpath -q -- "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")" || _dsh_rt=""
+  if [[ -S "$_dsh_sock" && ( ( -n "$_dsh_ssh" && "$_dsh_sock" == "$_dsh_ssh"/* ) || ( -n "$_dsh_rt" && "$_dsh_sock" == "$_dsh_rt"/* ) ) ]]; then
+    POST_MASK_BINDS+=("$_dsh_sock")
+    EXTRA_ENV+=("SSH_AUTH_SOCK=$_dsh_sock")
+    [[ ! -f "$HOME/.ssh/known_hosts" ]] || POST_MASK_BINDS+=("$HOME/.ssh/known_hosts")
+    echo "   ssh-agent: forwarding $SSH_AUTH_SOCK" >&2
+  else
+    echo "   ssh-agent: not forwarded ($SSH_AUTH_SOCK is not a socket under ~/.ssh or \$XDG_RUNTIME_DIR)" >&2
+  fi
+  unset _dsh_sock _dsh_ssh _dsh_rt
+fi
