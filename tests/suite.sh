@@ -627,28 +627,41 @@ DSH_ENV=$(cd "$PROJECT_DIR" && DSH_HOME="$FAKE_HOME/.dsh-alt" DSH_PERMISSION_MOD
 assert "DSH_HOME/DSH_PERMISSION_MODE passed through and custom DSH_HOME writable" '[ "$DSH_ENV" = "$FAKE_HOME/.dsh-alt|read-only|1" ] && [ -f "$FAKE_HOME/.dsh-alt/probe" ]'
 rm -rf "$FAKE_RUNTIME" "$FIXTURE_DIR/node-install"
 
-# Git: no prompt hang; SSH agent forwarded only from a masked dir.
+# Git: no prompt hang; only the dedicated sandbox ssh-agent is forwarded.
 GIT_PROMPT=$(run_sandbox dsh -- /bin/bash -c 'echo "$GIT_TERMINAL_PROMPT"' 2>/dev/null)
 assert "dsh sets GIT_TERMINAL_PROMPT=0 (no silent credential-prompt hang)" '[ "$GIT_PROMPT" = "0" ]'
 if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null; then
   rm -rf "$FAKE_HOME" && mkdir -p "$FAKE_HOME/.ssh"
   echo "SECRET_KEY" > "$FAKE_HOME/.ssh/id_ed25519"
   echo "github.com ssh-ed25519 AAAATEST" > "$FAKE_HOME/.ssh/known_hosts"
+  start_agent() { ssh-agent -a "$1" | sed -n 's/^echo Agent pid \([0-9]*\);$/\1/p'; }
   AGENT_SOCK="$FAKE_HOME/.ssh/a.sock"
-  AGENT_PID=$(ssh-agent -a "$AGENT_SOCK" | sed -n 's/^echo Agent pid \([0-9]*\);$/\1/p')
+  AGENT_PID=$(start_agent "$AGENT_SOCK")
   set +e
-  SSH_AUTH_SOCK="$AGENT_SOCK" run_sandbox dsh -- /bin/bash -c 'ssh-add -l >/dev/null 2>&1; exit $?' 2>/dev/null
+  SAFE_AGENT_SSH_SOCK="$AGENT_SOCK" run_sandbox dsh -- /bin/bash -c 'ssh-add -l >/dev/null 2>&1; exit $?' 2>/dev/null
   RET=$?
   set -e
-  assert "ssh-agent socket reachable inside dsh sandbox (no identities = 1, not 2)" '[ $RET -eq 1 ]'
-  SSH_OUT=$(SSH_AUTH_SOCK="$AGENT_SOCK" run_sandbox dsh -- /bin/bash -c 'cat ~/.ssh/known_hosts; cat ~/.ssh/id_ed25519 2>/dev/null || echo KEY_HIDDEN; touch ~/.ssh/known_hosts 2>/dev/null && echo KH_WRITABLE; true' 2>/dev/null)
+  assert "dedicated ssh-agent socket reachable inside dsh sandbox (no identities = 1, not 2)" '[ $RET -eq 1 ]'
+  SSH_OUT=$(SAFE_AGENT_SSH_SOCK="$AGENT_SOCK" run_sandbox dsh -- /bin/bash -c 'echo "SOCK=$SSH_AUTH_SOCK"; cat ~/.ssh/known_hosts; cat ~/.ssh/id_ed25519 2>/dev/null || echo KEY_HIDDEN; touch ~/.ssh/known_hosts 2>/dev/null && echo KH_WRITABLE; true' 2>/dev/null)
+  assert "sandbox SSH_AUTH_SOCK is the dedicated socket" 'echo "$SSH_OUT" | grep -Fxq "SOCK=$AGENT_SOCK"'
   assert "known_hosts readable, private key hidden, known_hosts read-only" 'echo "$SSH_OUT" | grep -q AAAATEST && echo "$SSH_OUT" | grep -q KEY_HIDDEN && ! echo "$SSH_OUT" | grep -q -e SECRET_KEY -e KH_WRITABLE'
+
+  # The shell's own SSH_AUTH_SOCK (some other agent) must never be forwarded.
+  OTHER_SOCK="$FAKE_HOME/.ssh/other.sock"
+  OTHER_PID=$(start_agent "$OTHER_SOCK")
+  OTHER_OUT=$(SSH_AUTH_SOCK="$OTHER_SOCK" SAFE_AGENT_SSH_SOCK="$FAKE_HOME/.ssh/absent.sock" run_sandbox dsh -- /bin/bash -c 'echo "SOCK=[${SSH_AUTH_SOCK:-}]"; ls ~/.ssh | grep -c other.sock; true' 2>/dev/null)
+  assert "another agent's SSH_AUTH_SOCK is not forwarded" 'echo "$OTHER_OUT" | grep -Fxq "SOCK=[]" && echo "$OTHER_OUT" | tail -n1 | grep -Fxq 0'
+
+  # A socket outside the masked dirs is skipped with a notice, launch still succeeds.
+  OUTSIDE_SOCK="$FIXTURE_DIR/outside.sock"
+  OUTSIDE_PID=$(start_agent "$OUTSIDE_SOCK")
   set +e
-  SSH_AUTH_SOCK=/tmp/not-a-masked-socket run_sandbox dsh -- /bin/true 2>/dev/null
+  OUTSIDE_ERR=$(SAFE_AGENT_SSH_SOCK="$OUTSIDE_SOCK" run_sandbox dsh -- /bin/true 2>&1 >/dev/null)
   RET=$?
   set -e
-  assert "SSH_AUTH_SOCK outside masked dirs is skipped, launch still succeeds" '[ $RET -eq 0 ]'
-  [ -z "$AGENT_PID" ] || kill "$AGENT_PID" 2>/dev/null || true
+  assert "dedicated socket outside masked dirs is skipped, launch still succeeds" '[ $RET -eq 0 ] && echo "$OUTSIDE_ERR" | grep -q "not forwarded"'
+  for pid in "$AGENT_PID" "$OTHER_PID" "$OUTSIDE_PID"; do [ -z "$pid" ] || kill "$pid" 2>/dev/null || true; done
+  rm -f "$OUTSIDE_SOCK"
 fi
 
 echo "=== Results: $PASS passed, $FAIL failed ==="

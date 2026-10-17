@@ -177,16 +177,11 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   cache under `~/.dsh/.safe-agent/` instead of the shared host store.
   Git: HTTPS pushes have no credentials (`~/.config/gh` and
   `~/.git-credentials` are masked) and fail immediately
-  (`GIT_TERMINAL_PROMPT=0`) instead of hanging. For SSH, if `SSH_AUTH_SOCK`
-  names a socket under `~/.ssh` or `$XDG_RUNTIME_DIR` (OpenSSH 10 puts
-  `ssh-agent` sockets in `~/.ssh/agent/`), that socket and
-  `~/.ssh/known_hosts` are re-exposed (key files stay hidden), so keys you
-  loaded on the host (`ssh-add -t 1h`) work until they expire or you run
-  `ssh-add -D`. A launch notice says whether it was forwarded. Start the
-  agent and load keys on the host *before* launching, from the same shell;
-  an agent started inside the sandbox cannot create its socket in the
-  read-only `~/.ssh`. For the VS Code panel, `SSH_AUTH_SOCK` must be in
-  VS Code's own environment.
+  (`GIT_TERMINAL_PROMPT=0`) instead of hanging. For SSH, only a dedicated
+  sandbox agent socket is forwarded (`$SAFE_AGENT_SSH_SOCK`, default
+  `$XDG_RUNTIME_DIR/safe-agent-ssh.sock`) together with a read-only
+  `~/.ssh/known_hosts`; key files stay hidden and the shell's own
+  `SSH_AUTH_SOCK` is ignored. See "Git over SSH for dsh" below.
   dsh's own bash tool nests a second bwrap inside this one; that works with
   unprivileged user namespaces. Only the launch directory is writable, so
   sessions on other folders opened from the web UI are read-only.
@@ -194,6 +189,34 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
 - Profiles are trusted executable Bash. The host stays broadly readable
   except for explicitly masked paths; this is a containment wrapper, not
   a full sandbox redesign.
+
+## Git over SSH for dsh
+
+The sandbox never sees key files. To let a sandboxed dsh push over SSH you
+load a key into a dedicated, permanently running agent and forward only
+that agent's socket. Setup (once, on the host; files in `contrib/ssh-agent/`):
+
+```bash
+cp contrib/ssh-agent/safe-agent-ssh.{socket,service} ~/.config/systemd/user/
+install -m 755 contrib/ssh-agent/safe-ssh-askpass ~/.local/bin/
+systemctl --user daemon-reload && systemctl --user enable --now safe-agent-ssh.socket
+# add contrib/ssh-agent/sshon.zsh to your zshrc (sshon / sshoff)
+```
+
+- The agent is socket-activated by a systemd user unit, so the socket path
+  and inode never change. That matters: the sandbox bind-mounts the socket at
+  launch, so it must exist then and survive key changes. If you restart the
+  *service*, restart the sandboxed dsh too.
+- `sshon [duration]` loads the key with `ssh-add -t <duration> -h github.com -c`:
+  it expires (default 1h), is usable for github.com only, and `safe-ssh-askpass`
+  shows a zenity Allow/Deny popup every time it is used (auto-deny after 30 s;
+  `SSHON_CONFIRM=0 sshon` skips the popup). `sshoff` removes it at once.
+- With no key loaded, forwarding exposes nothing. A forwarded agent still
+  lets the sandbox sign as you while the key is loaded and you click Allow,
+  for any repo your account can write to; use a per-repo deploy key if you
+  need a harder limit.
+- Works for the VS Code panel without any setting, because the socket path
+  is fixed. Override the path with `SAFE_AGENT_SSH_SOCK`.
 
 ## Verifying an install
 
