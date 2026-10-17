@@ -6,8 +6,8 @@ launcher for AI coding-agent CLIs. One entrypoint,
 only to the current project directory and its own state directories. The
 rest of the host is read-only, and common credentials are hidden.
 
-Bundled profiles: [opencode](https://opencode.ai), Qoder CLI (`qodercli`)
-and pi. Adding another agent means adding one small profile file.
+Bundled profiles: [opencode](https://opencode.ai), Qoder CLI (`qodercli`),
+pi and DeepSeek Harness (`dsh`). Adding another agent means adding one small profile file.
 
 ## Requirements
 
@@ -44,6 +44,8 @@ profiles/
                     # forces a private in-sandbox server (see below)
   qoder.sh          # ~/.qoder + ~/.config/qoder; executable trees read-only
   pi.sh             # ~/.pi/agent; launcher + install trees read-only
+  dsh.sh            # $DSH_HOME (~/.dsh), every dsh profile; resolves
+                    # fnm-style PATH shims (see below)
 install.sh          # copies launcher + profiles, creates safe-* symlinks
 tests/
   run.sh            # builds a fake-HOME fixture and runs the suite
@@ -68,7 +70,8 @@ safe-agent opencode -- opencode --version
 safe-agent opencode -- opencode serve --port 4096
 safe-agent qoder -- qodercli --version
 safe-agent pi -- pi --version
-safe-agent doctor opencode|qoder|pi
+safe-agent dsh -- dsh ofm-test --port 3082
+safe-agent doctor opencode|qoder|pi|dsh
 ```
 
 Multicall (via symlink basename):
@@ -77,6 +80,7 @@ Multicall (via symlink basename):
 safe-opencode [args...]   # == safe-agent opencode -- opencode [args...]
 safe-qoder [args...]      # == safe-agent qoder -- qodercli [args...]
 safe-pi [args...]         # == safe-agent pi -- pi [args...]
+safe-dsh [args...]        # == safe-agent dsh -- dsh [args...]
 ```
 
 `safe-qoder` defaults to `qodercli`, not the `qoder` dispatcher: the
@@ -159,6 +163,21 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   passes through unchanged. On the host, avoid bare `opencode`: it starts
   the unconfined background service (stop it with `opencode service stop`).
   The discovery file is only masked if it exists at launch.
+- dsh: the whole `$DSH_HOME` (default `~/.dsh`) is writable, so every dsh
+  profile works unchanged (`safe-dsh web`, `safe-dsh ofm-test`,
+  `safe-dsh plugin --profile <name> ...`) and all launcher and app flags
+  pass through verbatim. That includes the provider credentials store
+  (`~/.dsh/.credentials.yaml`), which dsh needs to call its models, and
+  code-bearing state that runs on the next boot: `profiles/*/node_modules`,
+  `profiles/*/cordis.patch.yml` (`!!js` expressions), `package.json` and
+  `~/.dsh/.env`. `DSH_HOME` and `DSH_PERMISSION_MODE` are passed through
+  when set. Put proxy settings in `~/.dsh/.env` (dsh honors
+  `HTTP(S)_PROXY`/`NO_PROXY` there); proxy env vars and `NODE_OPTIONS` are
+  dropped like any other variable. Plugin installs use a pnpm store and
+  cache under `~/.dsh/.safe-agent/` instead of the shared host store.
+  dsh's own bash tool nests a second bwrap inside this one; that works with
+  unprivileged user namespaces. Only the launch directory is writable, so
+  sessions on other folders opened from the web UI are read-only.
 - Launch diagnostics go to stderr, so child stdout stays machine-readable.
 - Profiles are trusted executable Bash. The host stays broadly readable
   except for explicitly masked paths; this is a containment wrapper, not
@@ -190,6 +209,17 @@ Editor integrations that launch `safe-opencode` (for example the VS Code
 extension) keep working, but must start it with the working directory set
 to a project, because launching from `$HOME` is refused.
 
+For the DSH VS Code panel extension (`fengze233.dsh-vscode-panel`), point
+it at the wrapper; it keeps passing `--profile <dsh.profile> --host
+--port --no-open` and runs it from the workspace root:
+
+```jsonc
+"dsh.executablePath": "/home/<you>/.local/bin/safe-dsh",
+```
+
+Open a folder first: with no workspace folder the extension starts from
+VS Code's own directory (often `$HOME`), which is refused.
+
 ## Tests
 
 ```bash
@@ -216,7 +246,9 @@ sandbox.
   installer on the host before first using it through `safe-agent`.
 - **`$XDG_RUNTIME_DIR` is hidden.** Tools that live there (for example
   `fnm` multishell shims under `/run/user/<uid>/fnm_multishells`) are not
-  reachable inside the sandbox even if they are on `PATH`.
+  reachable inside the sandbox even if they are on `PATH`. The dsh profile
+  works around this by resolving such `PATH` entries to their real
+  directories; other profiles do not.
 - **Multicall names are mapped in the launcher.** A new profile works with
   `safe-agent <profile> -- <command>` immediately. A `safe-<profile>`
   shortcut also needs an entry in `multicall_profile()`.
