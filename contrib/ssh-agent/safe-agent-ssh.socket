@@ -1,0 +1,10 @@
+[Unit]
+Description=Socket for the safe-agent sandbox SSH key agent
+
+[Socket]
+ListenStream=%t/safe-agent-ssh.sock
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

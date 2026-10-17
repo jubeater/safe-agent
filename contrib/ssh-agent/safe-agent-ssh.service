@@ -1,0 +1,9 @@
+[Unit]
+Description=SSH key agent for safe-agent sandboxes (keys are loaded by sshon)
+Requires=safe-agent-ssh.socket
+
+[Service]
+ExecStart=/usr/bin/ssh-agent -D
+Environment=SSH_ASKPASS=%h/.local/bin/safe-ssh-askpass
+SuccessExitStatus=2
+Type=simple

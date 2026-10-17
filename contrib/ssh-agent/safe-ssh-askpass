@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Confirmation prompt for the sandbox ssh-agent (keys added with `ssh-add -c`).
+# ssh-agent runs this with the question as $1; exit 0 = allow, anything else
+# = deny. Times out to deny so an unattended git command fails, not hangs.
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" DISPLAY="${DISPLAY:-:1}"
+exec zenity --question --no-markup --title="SSH key use request" \
+  --text="${1:-Allow use of SSH key?}" \
+  --ok-label=Allow --cancel-label=Deny \
+  --timeout="${SAFE_SSH_ASKPASS_TIMEOUT:-30}"
