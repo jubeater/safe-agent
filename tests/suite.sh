@@ -543,6 +543,12 @@ set -e
 assert "Running from HOME rejected" '[ $RET -ne 0 ]'
 assert "Running from HOME diagnostic is clear" 'echo "$OUTPUT" | grep -q "must not be /, HOME, or an ancestor"'
 
+# ssh must be able to parse its system config (root-owned files appear as nobody)
+if command -v ssh >/dev/null && [ -f /etc/ssh/ssh_config ]; then
+  SSH_G_OUT=$(run_sandbox opencode -- /bin/bash -c 'ssh -G example.invalid >/dev/null; echo "rc=$?"' 2>&1)
+  assert "ssh parses its config inside the sandbox (no 'Bad owner or permissions')" 'echo "$SSH_G_OUT" | grep -Fxq "rc=0" && ! echo "$SSH_G_OUT" | grep -q "Bad owner"'
+fi
+
 # Child stdout cleanliness
 STDOUT_TEST=$(run_sandbox opencode -- /bin/echo "ONLY_STDOUT" 2>/dev/null)
 assert "Child stdout contains only child output" '[ "$STDOUT_TEST" = "ONLY_STDOUT" ]'

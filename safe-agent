@@ -510,6 +510,13 @@ SENSITIVE_FILES=(
   "$HOME/.cargo/credentials.toml"
 
   "/run/docker.sock"
+
+  # Not a secret: root-owned host files show up as nobody:nobody inside the
+  # sandbox (the user namespace maps only the caller's uid), and OpenSSH
+  # refuses config files that are neither root's nor the user's ("Bad owner
+  # or permissions"), which breaks every ssh and git-over-ssh call. An empty
+  # file owned by the sandbox user restores the built-in defaults.
+  "/etc/ssh/ssh_config"
 )
 
 declare -A _seen_files=()
