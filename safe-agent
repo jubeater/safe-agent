@@ -7,6 +7,7 @@
 #   safe-opencode [args...]  == safe-agent opencode -- opencode [args...]
 #   safe-qoder [args...]     == safe-agent qoder -- qodercli [args...]
 #   safe-pi [args...]        == safe-agent pi -- pi [args...]
+#   safe-dsh [args...]       == safe-agent dsh -- dsh [args...]
 #
 # Policy (intentionally boring):
 # - host filesystem is readable; writable only at the workspace + profile state
@@ -35,11 +36,13 @@ Examples:
   safe-agent opencode -- opencode serve --port 4096
   safe-agent qoder -- qodercli --version
   safe-agent pi -- pi --version
+  safe-agent dsh -- dsh ofm-test --port 3082
 
 Multicall (symlink) form:
   safe-opencode [args...]
   safe-qoder [args...]
   safe-pi [args...]
+  safe-dsh [args...]
 EOF
 }
 
@@ -58,6 +61,7 @@ multicall_profile() {
     safe-opencode) echo "opencode" ;;
     safe-qoder) echo "qoder" ;;
     safe-pi) echo "pi" ;;
+    safe-dsh) echo "dsh" ;;
     *) return 1 ;;
   esac
 }

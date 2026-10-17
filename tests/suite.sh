@@ -272,6 +272,8 @@ mkdir -p "$FAKE_HOME/.pi/agent" "$FAKE_HOME/.local/share/opencode" "$FAKE_HOME/.
 echo "SECRET_PI_AUTH" > "$FAKE_HOME/.pi/agent/auth.json"
 echo "SECRET_OPENCODE_AUTH" > "$FAKE_HOME/.local/share/opencode/auth.json"
 echo "SECRET_QODER_AUTH" > "$FAKE_HOME/.qoder/auth.json"
+mkdir -p "$FAKE_HOME/.dsh"
+echo "SECRET_DSH_AUTH" > "$FAKE_HOME/.dsh/.credentials.yaml"
 
 # Qoder profile cannot read Pi auth AND cannot read OpenCode auth
 QODER_PI_AUTH=$(run_sandbox qoder -- /bin/bash -c 'cat "$HOME/.pi/agent/auth.json" 2>/dev/null || echo HIDDEN' 2>/dev/null)
@@ -284,6 +286,12 @@ PI_OC_AUTH=$(run_sandbox pi -- /bin/bash -c 'cat "$HOME/.local/share/opencode/au
 assert "Pi cannot read OpenCode peer auth" '[ "$PI_OC_AUTH" = "HIDDEN" ]'
 PI_Q_AUTH=$(run_sandbox pi -- /bin/bash -c 'cat "$HOME/.qoder/auth.json" 2>/dev/null || echo HIDDEN' 2>/dev/null)
 assert "Pi cannot read Qoder peer auth" '[ "$PI_Q_AUTH" = "HIDDEN" ]'
+
+# OpenCode cannot read dsh credentials; dsh cannot read OpenCode auth
+OC_DSH_AUTH=$(run_sandbox opencode -- /bin/bash -c 'cat "$HOME/.dsh/.credentials.yaml" 2>/dev/null || echo HIDDEN' 2>/dev/null)
+assert "OpenCode cannot read dsh peer credentials" '[ "$OC_DSH_AUTH" = "HIDDEN" ]'
+DSH_OC_AUTH=$(run_sandbox dsh -- /bin/bash -c 'cat "$HOME/.local/share/opencode/auth.json" 2>/dev/null || echo HIDDEN' 2>/dev/null)
+assert "dsh cannot read OpenCode peer auth" '[ "$DSH_OC_AUTH" = "HIDDEN" ]'
 
 # Overlap refusal: workspace inside Pi state
 mkdir -p "$FAKE_HOME/.pi/agent/workspace"
@@ -455,9 +463,17 @@ exit 77
 EOF
 chmod 755 "$STUB_BIN/pi"
 
+cat > "$STUB_BIN/dsh" << 'EOF'
+#!/usr/bin/env bash
+printf "%s\n" "$0" "$@" > "$PWD/stub_invoked.log"
+exit 77
+EOF
+chmod 755 "$STUB_BIN/dsh"
+
 ln -sf safe-agent "$PROJECT_DIR/safe-opencode"
 ln -sf safe-agent "$PROJECT_DIR/safe-qoder"
 ln -sf safe-agent "$PROJECT_DIR/safe-pi"
+ln -sf safe-agent "$PROJECT_DIR/safe-dsh"
 
 STUB_OUT_FILE="$PROJECT_DIR/stub_invoked.log"
 
@@ -500,7 +516,20 @@ assert "Multicall safe-pi exit status 77 from stub" '[ $MC_RET -eq 77 ]'
 assert "Multicall safe-pi executed pi binary" '[ -f "$STUB_OUT_FILE" ] && head -n 1 "$STUB_OUT_FILE" | grep -q "/pi"'
 assert "Multicall safe-pi passed exact arguments" 'grep -Fxq "eta" "$STUB_OUT_FILE" && grep -Fxq "theta iota" "$STUB_OUT_FILE"'
 
-rm -f "$PROJECT_DIR/safe-opencode" "$PROJECT_DIR/safe-qoder" "$PROJECT_DIR/safe-pi" "$STUB_OUT_FILE"
+# Test multicall 4: safe-dsh -> dsh stub (profile name + inner flags pass through)
+rm -f "$STUB_OUT_FILE"
+set +e
+(
+  cd "$PROJECT_DIR"
+  PATH="$STUB_BIN:$PATH" HOME="$FAKE_HOME" "$PROJECT_DIR/safe-dsh" ofm-test --port 3082 "kappa lambda"
+) 2>/dev/null
+MC_RET=$?
+set -e
+assert "Multicall safe-dsh exit status 77 from stub" '[ $MC_RET -eq 77 ]'
+assert "Multicall safe-dsh executed dsh binary" '[ -f "$STUB_OUT_FILE" ] && head -n 1 "$STUB_OUT_FILE" | grep -q "/dsh"'
+assert "Multicall safe-dsh passed exact arguments" '[ "$(tail -n +2 "$STUB_OUT_FILE" | paste -sd"|")" = "ofm-test|--port|3082|kappa lambda" ]'
+
+rm -f "$PROJECT_DIR/safe-opencode" "$PROJECT_DIR/safe-qoder" "$PROJECT_DIR/safe-pi" "$PROJECT_DIR/safe-dsh" "$STUB_OUT_FILE"
 rm -rf "$STUB_BIN"
 
 # ---------------------------------------------------------------------------
@@ -561,6 +590,42 @@ for refused in "--server http://127.0.0.1:1" "run --server=http://127.0.0.1:1 hi
   assert "Refused: opencode $refused" '[ $RET -ne 0 ] && echo "$OUTPUT" | grep -q "^safe-agent:" && ! echo "$OUTPUT" | grep -q "^dry-run:"'
 done
 rm -rf "$STUB_BIN"
+
+# ---------------------------------------------------------------------------
+# Test Group 10: dsh profile (DSH_HOME state + PATH under the hidden runtime dir)
+# ---------------------------------------------------------------------------
+echo "--- Group 10: dsh Profile ---"
+rm -rf "$FAKE_HOME" && mkdir -p "$FAKE_HOME"
+set +e
+run_sandbox dsh -- /bin/bash -c 'mkdir -p "$HOME/.dsh/profiles/ofm-test" && touch "$HOME/.dsh/profiles/ofm-test/cordis.patch.yml"' 2>/dev/null
+RET=$?
+set -e
+assert "dsh state (~/.dsh) writable for any dsh profile" '[ $RET -eq 0 ] && [ -f "$FAKE_HOME/.dsh/profiles/ofm-test/cordis.patch.yml" ]'
+set +e
+run_sandbox dsh -- /bin/bash -c 'touch "$HOME/outside_dsh"' 2>/dev/null
+RET=$?
+set -e
+assert "dsh cannot write elsewhere in HOME" '[ $RET -ne 0 ] && [ ! -e "$FAKE_HOME/outside_dsh" ]'
+
+# fnm-style shim: a PATH entry under XDG_RUNTIME_DIR that symlinks to the real
+# Node install. The runtime dir is hidden, so the profile must resolve it.
+FAKE_RUNTIME="$FIXTURE_DIR/runtime"
+REAL_NODE_BIN="$FIXTURE_DIR/node-install/bin"
+rm -rf "$FAKE_RUNTIME" "$FIXTURE_DIR/node-install"
+mkdir -p "$FAKE_RUNTIME/fnm_multishells" "$REAL_NODE_BIN"
+printf '#!/bin/sh\necho "STUB_DSH $*"\n' > "$REAL_NODE_BIN/dsh" && chmod 755 "$REAL_NODE_BIN/dsh"
+ln -s "$FIXTURE_DIR/node-install" "$FAKE_RUNTIME/fnm_multishells/123_456"
+dsh_run() {
+  (cd "$PROJECT_DIR" && unset DSH_HOME DSH_PERMISSION_MODE &&
+    XDG_RUNTIME_DIR="$FAKE_RUNTIME" PATH="$FAKE_RUNTIME/fnm_multishells/123_456/bin:$PATH" HOME="$FAKE_HOME" "$LAUNCHER" dsh -- "$@")
+}
+DSH_OUT=$(dsh_run dsh web --port 1 2>/dev/null)
+assert "dsh resolves through a PATH shim under the hidden runtime dir" '[ "$DSH_OUT" = "STUB_DSH web --port 1" ]'
+DSH_PATH=$(dsh_run /bin/bash -c 'echo "$PATH"' 2>/dev/null)
+assert "Sandbox PATH has the real install dir, not the runtime shim" 'echo "$DSH_PATH" | tr ":" "\n" | grep -Fxq "$REAL_NODE_BIN" && ! echo "$DSH_PATH" | grep -q "$FAKE_RUNTIME"'
+DSH_ENV=$(cd "$PROJECT_DIR" && DSH_HOME="$FAKE_HOME/.dsh-alt" DSH_PERMISSION_MODE=read-only HOME="$FAKE_HOME" "$LAUNCHER" dsh -- /bin/bash -c 'echo "$DSH_HOME|$DSH_PERMISSION_MODE|$SAFE_DSH"; touch "$DSH_HOME/probe"' 2>/dev/null)
+assert "DSH_HOME/DSH_PERMISSION_MODE passed through and custom DSH_HOME writable" '[ "$DSH_ENV" = "$FAKE_HOME/.dsh-alt|read-only|1" ] && [ -f "$FAKE_HOME/.dsh-alt/probe" ]'
+rm -rf "$FAKE_RUNTIME" "$FIXTURE_DIR/node-install"
 
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ $FAIL -eq 0 ]; then
