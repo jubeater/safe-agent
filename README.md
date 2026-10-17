@@ -175,6 +175,18 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   `HTTP(S)_PROXY`/`NO_PROXY` there); proxy env vars and `NODE_OPTIONS` are
   dropped like any other variable. Plugin installs use a pnpm store and
   cache under `~/.dsh/.safe-agent/` instead of the shared host store.
+  Git: HTTPS pushes have no credentials (`~/.config/gh` and
+  `~/.git-credentials` are masked) and fail immediately
+  (`GIT_TERMINAL_PROMPT=0`) instead of hanging. For SSH, if `SSH_AUTH_SOCK`
+  names a socket under `~/.ssh` or `$XDG_RUNTIME_DIR` (OpenSSH 10 puts
+  `ssh-agent` sockets in `~/.ssh/agent/`), that socket and
+  `~/.ssh/known_hosts` are re-exposed (key files stay hidden), so keys you
+  loaded on the host (`ssh-add -t 1h`) work until they expire or you run
+  `ssh-add -D`. A launch notice says whether it was forwarded. Start the
+  agent and load keys on the host *before* launching, from the same shell;
+  an agent started inside the sandbox cannot create its socket in the
+  read-only `~/.ssh`. For the VS Code panel, `SSH_AUTH_SOCK` must be in
+  VS Code's own environment.
   dsh's own bash tool nests a second bwrap inside this one; that works with
   unprivileged user namespaces. Only the launch directory is writable, so
   sessions on other folders opened from the web UI are read-only.
@@ -249,6 +261,9 @@ sandbox.
   reachable inside the sandbox even if they are on `PATH`. The dsh profile
   works around this by resolving such `PATH` entries to their real
   directories; other profiles do not.
+- **Docker/Podman are unusable inside the sandbox.** `/run/docker.sock`
+  is masked and `$XDG_RUNTIME_DIR` (podman's socket dir) is hidden, so an
+  agent can write and statically check compose files but not run them.
 - **Multicall names are mapped in the launcher.** A new profile works with
   `safe-agent <profile> -- <command>` immediately. A `safe-<profile>`
   shortcut also needs an entry in `multicall_profile()`.

@@ -627,6 +627,30 @@ DSH_ENV=$(cd "$PROJECT_DIR" && DSH_HOME="$FAKE_HOME/.dsh-alt" DSH_PERMISSION_MOD
 assert "DSH_HOME/DSH_PERMISSION_MODE passed through and custom DSH_HOME writable" '[ "$DSH_ENV" = "$FAKE_HOME/.dsh-alt|read-only|1" ] && [ -f "$FAKE_HOME/.dsh-alt/probe" ]'
 rm -rf "$FAKE_RUNTIME" "$FIXTURE_DIR/node-install"
 
+# Git: no prompt hang; SSH agent forwarded only from a masked dir.
+GIT_PROMPT=$(run_sandbox dsh -- /bin/bash -c 'echo "$GIT_TERMINAL_PROMPT"' 2>/dev/null)
+assert "dsh sets GIT_TERMINAL_PROMPT=0 (no silent credential-prompt hang)" '[ "$GIT_PROMPT" = "0" ]'
+if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null; then
+  rm -rf "$FAKE_HOME" && mkdir -p "$FAKE_HOME/.ssh"
+  echo "SECRET_KEY" > "$FAKE_HOME/.ssh/id_ed25519"
+  echo "github.com ssh-ed25519 AAAATEST" > "$FAKE_HOME/.ssh/known_hosts"
+  AGENT_SOCK="$FAKE_HOME/.ssh/a.sock"
+  AGENT_PID=$(ssh-agent -a "$AGENT_SOCK" | sed -n 's/^echo Agent pid \([0-9]*\);$/\1/p')
+  set +e
+  SSH_AUTH_SOCK="$AGENT_SOCK" run_sandbox dsh -- /bin/bash -c 'ssh-add -l >/dev/null 2>&1; exit $?' 2>/dev/null
+  RET=$?
+  set -e
+  assert "ssh-agent socket reachable inside dsh sandbox (no identities = 1, not 2)" '[ $RET -eq 1 ]'
+  SSH_OUT=$(SSH_AUTH_SOCK="$AGENT_SOCK" run_sandbox dsh -- /bin/bash -c 'cat ~/.ssh/known_hosts; cat ~/.ssh/id_ed25519 2>/dev/null || echo KEY_HIDDEN; touch ~/.ssh/known_hosts 2>/dev/null && echo KH_WRITABLE; true' 2>/dev/null)
+  assert "known_hosts readable, private key hidden, known_hosts read-only" 'echo "$SSH_OUT" | grep -q AAAATEST && echo "$SSH_OUT" | grep -q KEY_HIDDEN && ! echo "$SSH_OUT" | grep -q -e SECRET_KEY -e KH_WRITABLE'
+  set +e
+  SSH_AUTH_SOCK=/tmp/not-a-masked-socket run_sandbox dsh -- /bin/true 2>/dev/null
+  RET=$?
+  set -e
+  assert "SSH_AUTH_SOCK outside masked dirs is skipped, launch still succeeds" '[ $RET -eq 0 ]'
+  [ -z "$AGENT_PID" ] || kill "$AGENT_PID" 2>/dev/null || true
+fi
+
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ $FAIL -eq 0 ]; then
   exit 0
