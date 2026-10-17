@@ -146,6 +146,11 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   standard HOME locations. Symlinked sensitive paths are canonicalised to
   their targets before masking so aliases remain hidden without bubblewrap
   symlink mount failures, and duplicate destination masks are deduplicated.
+- Root-owned host files appear as `nobody:nobody` inside the sandbox (the
+  user namespace maps only your uid). OpenSSH rejects config files that are
+  not owned by root or you, so `/etc/ssh/ssh_config` is replaced by an empty
+  file owned by you; otherwise every `ssh` and `git push` over SSH fails with
+  "Bad owner or permissions".
 - Environment is rebuilt from an allowlist (`--clearenv`); only the
   documented variables plus `SAFE_AGENT=1`, `SAFE_AGENT_PROFILE=<name>`
   (and `SAFE_OPENCODE=1` for opencode) are set.
