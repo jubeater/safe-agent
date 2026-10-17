@@ -151,6 +151,12 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   not owned by root or you, so `/etc/ssh/ssh_config` is replaced by an empty
   file owned by you; otherwise every `ssh` and `git push` over SSH fails with
   "Bad owner or permissions".
+- Git over SSH works for every profile through one dedicated, constrained
+  ssh-agent (see "Git over SSH" below). Only that agent's socket and a
+  read-only `~/.ssh/known_hosts` are forwarded; key files stay hidden and
+  the shell's own `SSH_AUTH_SOCK` is ignored. `GIT_TERMINAL_PROMPT=0` is
+  always set, so an HTTPS git operation (no credentials in the sandbox)
+  fails immediately instead of hanging on a username prompt.
 - Environment is rebuilt from an allowlist (`--clearenv`); only the
   documented variables plus `SAFE_AGENT=1`, `SAFE_AGENT_PROFILE=<name>`
   (and `SAFE_OPENCODE=1` for opencode) are set.
@@ -180,13 +186,6 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   `HTTP(S)_PROXY`/`NO_PROXY` there); proxy env vars and `NODE_OPTIONS` are
   dropped like any other variable. Plugin installs use a pnpm store and
   cache under `~/.dsh/.safe-agent/` instead of the shared host store.
-  Git: HTTPS pushes have no credentials (`~/.config/gh` and
-  `~/.git-credentials` are masked) and fail immediately
-  (`GIT_TERMINAL_PROMPT=0`) instead of hanging. For SSH, only a dedicated
-  sandbox agent socket is forwarded (`$SAFE_AGENT_SSH_SOCK`, default
-  `$XDG_RUNTIME_DIR/safe-agent-ssh.sock`) together with a read-only
-  `~/.ssh/known_hosts`; key files stay hidden and the shell's own
-  `SSH_AUTH_SOCK` is ignored. See "Git over SSH for dsh" below.
   dsh's own bash tool nests a second bwrap inside this one; that works with
   unprivileged user namespaces. Only the launch directory is writable, so
   sessions on other folders opened from the web UI are read-only.
@@ -195,10 +194,10 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   except for explicitly masked paths; this is a containment wrapper, not
   a full sandbox redesign.
 
-## Git over SSH for dsh
+## Git over SSH
 
-The sandbox never sees key files. To let a sandboxed dsh push over SSH you
-load a key into a dedicated, permanently running agent and forward only
+The sandbox never sees key files. To let a sandboxed agent (any profile) use
+git over SSH you load a key into a dedicated, permanently running agent and forward only
 that agent's socket. Setup (once, on the host; files in `contrib/ssh-agent/`):
 
 ```bash
@@ -211,7 +210,7 @@ systemctl --user daemon-reload && systemctl --user enable --now safe-agent-ssh.s
 - The agent is socket-activated by a systemd user unit, so the socket path
   and inode never change. That matters: the sandbox bind-mounts the socket at
   launch, so it must exist then and survive key changes. If you restart the
-  *service*, restart the sandboxed dsh too.
+  *service*, restart sandboxed agents too.
 - `sshon [duration]` loads the key with `ssh-add -t <duration> -h github.com -c`:
   it expires (default 1h), is usable for github.com only, and `safe-ssh-askpass`
   shows a zenity Allow/Deny popup every time it is used (auto-deny after 30 s;

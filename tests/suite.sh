@@ -652,6 +652,13 @@ if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null; then
   assert "sandbox SSH_AUTH_SOCK is the dedicated socket" 'echo "$SSH_OUT" | grep -Fxq "SOCK=$AGENT_SOCK"'
   assert "known_hosts readable, private key hidden, known_hosts read-only" 'echo "$SSH_OUT" | grep -q AAAATEST && echo "$SSH_OUT" | grep -q KEY_HIDDEN && ! echo "$SSH_OUT" | grep -q -e SECRET_KEY -e KH_WRITABLE'
 
+  # Every profile gets the dedicated agent and the no-prompt git setting.
+  for prof in opencode qoder pi dsh; do
+    PROF_OUT=$(SAFE_AGENT_SSH_SOCK="$AGENT_SOCK" run_sandbox "$prof" -- /bin/bash -c 'echo "$SSH_AUTH_SOCK|$GIT_TERMINAL_PROMPT"; ssh-add -l >/dev/null 2>&1; echo "rc=$?"' 2>/dev/null)
+    assert "$prof: dedicated agent forwarded (reachable), GIT_TERMINAL_PROMPT=0" '[ "$PROF_OUT" = "$AGENT_SOCK|0
+rc=1" ]'
+  done
+
   # The shell's own SSH_AUTH_SOCK (some other agent) must never be forwarded.
   OTHER_SOCK="$FAKE_HOME/.ssh/other.sock"
   OTHER_PID=$(start_agent "$OTHER_SOCK")
