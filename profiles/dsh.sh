@@ -21,10 +21,6 @@ WRITABLE_DIRS+=(
   "$_dsh_home"
 )
 
-EXTRA_ENV+=(
-  "SAFE_DSH=1"
-)
-
 # dsh reads these bootstrap variables only from the launching environment
 # (never from a .env file), so pass them through when set.
 [[ -z "${DSH_HOME:-}" ]] || EXTRA_ENV+=("DSH_HOME=$DSH_HOME")

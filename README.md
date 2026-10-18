@@ -40,7 +40,7 @@ To uninstall, remove `safe-agent`, the `safe-*` symlinks and the
 ```text
 safe-agent          # launcher: parsing, validation, bwrap policy, env filtering, exec
 profiles/
-  opencode.sh       # XDG data/cache/state opencode + SAFE_OPENCODE=1;
+  opencode.sh       # XDG data/cache/state opencode;
                     # forces a private in-sandbox server (see below)
   qoder.sh          # ~/.qoder + ~/.config/qoder; executable trees read-only
   pi.sh             # ~/.pi/agent; launcher + install trees read-only
@@ -158,8 +158,9 @@ SAFE_AGENT_DRY_RUN=1 ./safe-agent opencode -- opencode --version
   always set, so an HTTPS git operation (no credentials in the sandbox)
   fails immediately instead of hanging on a username prompt.
 - Environment is rebuilt from an allowlist (`--clearenv`); only the
-  documented variables plus `SAFE_AGENT=1`, `SAFE_AGENT_PROFILE=<name>`
-  (and `SAFE_OPENCODE=1` for opencode) are set.
+  documented variables plus `SAFE_AGENT=1`, `SAFE_AGENT_PROFILE=<name>` and
+  a per-profile marker `SAFE_<PROFILE>=1` (`SAFE_OPENCODE`, `SAFE_QODER`,
+  `SAFE_PI`, `SAFE_DSH`) are set.
 - Network is intentionally shared (no `--unshare-net`): agents need it,
   and editor integrations need localhost.
 - Agent work must run *inside* the sandbox, not just the UI. OpenCode 2.x
@@ -236,7 +237,7 @@ Inside each sandbox:
 ```bash
 echo "$SAFE_AGENT"            # expect 1
 echo "$SAFE_AGENT_PROFILE"    # expect profile name
-echo "$SAFE_OPENCODE"         # expect 1 (opencode only)
+echo "$SAFE_<PROFILE>"        # expect 1 (e.g. SAFE_PI, SAFE_QODER)
 
 touch ./safe-agent-test         # expect success (workspace writable)
 touch ~/safe-agent-should-fail  # expect failure (host read-only)

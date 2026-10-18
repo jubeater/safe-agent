@@ -622,6 +622,11 @@ done
 #
 # Do NOT leak the parent shell's environment into the agent.
 #
+# One uniform marker per profile (SAFE_OPENCODE, SAFE_QODER, SAFE_PI, ...):
+# profile name upper-cased, '-' -> '_'.
+PROFILE_FLAG="${PROFILE^^}"
+PROFILE_FLAG="SAFE_${PROFILE_FLAG//-/_}"
+
 BWRAP+=(
   --clearenv
 
@@ -640,6 +645,7 @@ BWRAP+=(
 
   --setenv SAFE_AGENT "1"
   --setenv SAFE_AGENT_PROFILE "$PROFILE"
+  --setenv "$PROFILE_FLAG" "1"
 
   # No TTY and no credential helper in the sandbox: without this an HTTPS git
   # operation blocks forever on a username prompt instead of failing.

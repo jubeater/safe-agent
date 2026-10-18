@@ -26,7 +26,7 @@ assert() {
 run_sandbox() {
   (
     cd "$PROJECT_DIR"
-    unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME SAFE_AGENT SAFE_AGENT_PROFILE SAFE_OPENCODE
+    unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME SAFE_AGENT SAFE_AGENT_PROFILE SAFE_OPENCODE SAFE_QODER SAFE_PI SAFE_DSH
     HOME="$FAKE_HOME" "$LAUNCHER" "$@"
   )
 }
@@ -548,6 +548,13 @@ if command -v ssh >/dev/null && [ -f /etc/ssh/ssh_config ]; then
   SSH_G_OUT=$(run_sandbox opencode -- /bin/bash -c 'ssh -G example.invalid >/dev/null; echo "rc=$?"' 2>&1)
   assert "ssh parses its config inside the sandbox (no 'Bad owner or permissions')" 'echo "$SSH_G_OUT" | grep -Fxq "rc=0" && ! echo "$SSH_G_OUT" | grep -q "Bad owner"'
 fi
+
+# Uniform per-profile markers: SAFE_AGENT, SAFE_AGENT_PROFILE and SAFE_<PROFILE>
+for pair in opencode:SAFE_OPENCODE qoder:SAFE_QODER pi:SAFE_PI dsh:SAFE_DSH; do
+  prof="${pair%%:*}"; flag="${pair##*:}"
+  FLAG_OUT=$(run_sandbox "$prof" -- /bin/bash -c 'echo "$SAFE_AGENT|$SAFE_AGENT_PROFILE|${!1}"' _ "$flag" 2>/dev/null)
+  assert "$prof: SAFE_AGENT=1, SAFE_AGENT_PROFILE=$prof, $flag=1" '[ "$FLAG_OUT" = "1|$prof|1" ]'
+done
 
 # Child stdout cleanliness
 STDOUT_TEST=$(run_sandbox opencode -- /bin/echo "ONLY_STDOUT" 2>/dev/null)
