@@ -24,10 +24,6 @@ MASKED_FILES+=(
   "${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json"
 )
 
-EXTRA_ENV+=(
-  "SAFE_OPENCODE=1"
-)
-
 # OpenCode's TUI reads images from the host clipboard through the Wayland
 # compositor (native libwayland / wlr-data-control), but safe-agent masks the
 # whole XDG_RUNTIME_DIR. Re-expose only the compositor socket so image paste

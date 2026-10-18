@@ -550,6 +550,46 @@ for path in "${OWN_MASKED[@]+"${OWN_MASKED[@]}"}"; do
 done
 
 #
+# Sandbox ssh-agent forwarding (every profile, so any agent can use git over
+# SSH). Only a dedicated agent socket is ever forwarded: $SAFE_AGENT_SSH_SOCK,
+# default $XDG_RUNTIME_DIR/safe-agent-ssh.sock. The launching shell's own
+# SSH_AUTH_SOCK is ignored, so the sandbox cannot see any other agent. Key
+# files stay hidden (~/.ssh is masked); the agent holds keys only while the
+# user loads them with limits, e.g. `ssh-add -t 1h -c -h github.com <key>`
+# (expires, asks the user before every use, usable for github.com only; see
+# contrib/ssh-agent). The socket is bind-mounted, so it must exist at launch
+# and keep its inode: run the agent permanently (systemd user socket).
+# ~/.ssh/known_hosts is re-exposed read-only for host-key checks. Both go
+# through POST_MASK_BINDS, so they must lie inside a masked directory;
+# otherwise forwarding is skipped with a notice instead of failing the launch.
+# Nothing is printed when the socket does not exist.
+#
+within_masked_dir() {
+  local mask
+  for mask in "${UNIQ_SENSITIVE_DIRS[@]+"${UNIQ_SENSITIVE_DIRS[@]}"}"; do
+    path_strictly_within "$mask" "$1" && return 0
+  done
+  return 1
+}
+SSH_FORWARD_NOTE=""
+_ssh_sock="${SAFE_AGENT_SSH_SOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/safe-agent-ssh.sock}"
+if [[ -S "$_ssh_sock" ]]; then
+  canon="$(realpath -- "$_ssh_sock")" || fail "cannot resolve ssh agent socket: $_ssh_sock"
+  if within_masked_dir "$canon"; then
+    POST_MASK_BINDS+=("$canon")
+    EXTRA_ENV+=("SSH_AUTH_SOCK=$canon")
+    SSH_FORWARD_NOTE="ssh-agent: forwarding $canon"
+    if [[ -f "$HOME/.ssh/known_hosts" ]]; then
+      canon="$(realpath -- "$HOME/.ssh/known_hosts")" || fail "cannot resolve known_hosts"
+      if within_masked_dir "$canon"; then POST_MASK_BINDS+=("$canon"); fi
+    fi
+  else
+    SSH_FORWARD_NOTE="ssh-agent: not forwarded ($canon is not under a masked directory such as ~/.ssh or \$XDG_RUNTIME_DIR)"
+  fi
+fi
+unset _ssh_sock
+
+#
 # Profile-declared re-exposures (POST_MASK_BINDS).
 # A profile may name individual sockets or files that live inside a masked
 # sensitive directory (typically the compositor's Wayland socket, needed by a
@@ -582,6 +622,11 @@ done
 #
 # Do NOT leak the parent shell's environment into the agent.
 #
+# One uniform marker per profile (SAFE_OPENCODE, SAFE_QODER, SAFE_PI, ...):
+# profile name upper-cased, '-' -> '_'.
+PROFILE_FLAG="${PROFILE^^}"
+PROFILE_FLAG="SAFE_${PROFILE_FLAG//-/_}"
+
 BWRAP+=(
   --clearenv
 
@@ -600,6 +645,11 @@ BWRAP+=(
 
   --setenv SAFE_AGENT "1"
   --setenv SAFE_AGENT_PROFILE "$PROFILE"
+  --setenv "$PROFILE_FLAG" "1"
+
+  # No TTY and no credential helper in the sandbox: without this an HTTPS git
+  # operation blocks forever on a username prompt instead of failing.
+  --setenv GIT_TERMINAL_PROMPT "0"
 )
 
 # Profile-provided extra environment (static NAME=VALUE entries only).
@@ -622,6 +672,7 @@ fi
   echo "   workspace: $PROJECT"
   echo "   host filesystem: read-only"
   echo "   sensitive paths: hidden"
+  [[ -z "$SSH_FORWARD_NOTE" ]] || echo "   $SSH_FORWARD_NOTE"
 } >&2
 
 # Test hook: print the sandboxed command instead of executing it.

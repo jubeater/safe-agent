@@ -26,7 +26,7 @@ assert() {
 run_sandbox() {
   (
     cd "$PROJECT_DIR"
-    unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME SAFE_AGENT SAFE_AGENT_PROFILE SAFE_OPENCODE
+    unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME SAFE_AGENT SAFE_AGENT_PROFILE SAFE_OPENCODE SAFE_QODER SAFE_PI SAFE_DSH
     HOME="$FAKE_HOME" "$LAUNCHER" "$@"
   )
 }
@@ -549,6 +549,13 @@ if command -v ssh >/dev/null && [ -f /etc/ssh/ssh_config ]; then
   assert "ssh parses its config inside the sandbox (no 'Bad owner or permissions')" 'echo "$SSH_G_OUT" | grep -Fxq "rc=0" && ! echo "$SSH_G_OUT" | grep -q "Bad owner"'
 fi
 
+# Uniform per-profile markers: SAFE_AGENT, SAFE_AGENT_PROFILE and SAFE_<PROFILE>
+for pair in opencode:SAFE_OPENCODE qoder:SAFE_QODER pi:SAFE_PI dsh:SAFE_DSH; do
+  prof="${pair%%:*}"; flag="${pair##*:}"
+  FLAG_OUT=$(run_sandbox "$prof" -- /bin/bash -c 'echo "$SAFE_AGENT|$SAFE_AGENT_PROFILE|${!1}"' _ "$flag" 2>/dev/null)
+  assert "$prof: SAFE_AGENT=1, SAFE_AGENT_PROFILE=$prof, $flag=1" '[ "$FLAG_OUT" = "1|$prof|1" ]'
+done
+
 # Child stdout cleanliness
 STDOUT_TEST=$(run_sandbox opencode -- /bin/echo "ONLY_STDOUT" 2>/dev/null)
 assert "Child stdout contains only child output" '[ "$STDOUT_TEST" = "ONLY_STDOUT" ]'
@@ -651,6 +658,13 @@ if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null; then
   SSH_OUT=$(SAFE_AGENT_SSH_SOCK="$AGENT_SOCK" run_sandbox dsh -- /bin/bash -c 'echo "SOCK=$SSH_AUTH_SOCK"; cat ~/.ssh/known_hosts; cat ~/.ssh/id_ed25519 2>/dev/null || echo KEY_HIDDEN; touch ~/.ssh/known_hosts 2>/dev/null && echo KH_WRITABLE; true' 2>/dev/null)
   assert "sandbox SSH_AUTH_SOCK is the dedicated socket" 'echo "$SSH_OUT" | grep -Fxq "SOCK=$AGENT_SOCK"'
   assert "known_hosts readable, private key hidden, known_hosts read-only" 'echo "$SSH_OUT" | grep -q AAAATEST && echo "$SSH_OUT" | grep -q KEY_HIDDEN && ! echo "$SSH_OUT" | grep -q -e SECRET_KEY -e KH_WRITABLE'
+
+  # Every profile gets the dedicated agent and the no-prompt git setting.
+  for prof in opencode qoder pi dsh; do
+    PROF_OUT=$(SAFE_AGENT_SSH_SOCK="$AGENT_SOCK" run_sandbox "$prof" -- /bin/bash -c 'echo "$SSH_AUTH_SOCK|$GIT_TERMINAL_PROMPT"; ssh-add -l >/dev/null 2>&1; echo "rc=$?"' 2>/dev/null)
+    assert "$prof: dedicated agent forwarded (reachable), GIT_TERMINAL_PROMPT=0" '[ "$PROF_OUT" = "$AGENT_SOCK|0
+rc=1" ]'
+  done
 
   # The shell's own SSH_AUTH_SOCK (some other agent) must never be forwarded.
   OTHER_SOCK="$FAKE_HOME/.ssh/other.sock"
